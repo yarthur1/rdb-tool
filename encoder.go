@@ -8,10 +8,10 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/BrotherGao/RDB/crc64"
+	"github.com/yarthur1/rdb-tool/crc64"
 )
 
-const Version = 6
+//const Version = 6
 
 type Encoder struct {
 	w   io.Writer

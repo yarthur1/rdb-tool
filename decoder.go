@@ -1,4 +1,12 @@
-// Package rdb implements parsing and encoding of the Redis RDB file format.
+// Package decode implements parsing of the Redis RDB file format.
+/*
+1.modified Decoder interface func StartHash StartSet StartList StartZSet(add paras encodetype and sizezip)
+2.const Version = 6  from cupcake rdb/encoder.go
+3.ZSET version 2 with doubles stored in binary.(not used)
+4.modified read func readZipmap readZiplist readIntset readZiplistZset readZiplistHash(add paras encodetype)
+5.skip module and stream parse
+*/
+
 package rdb
 
 import (
@@ -10,8 +18,11 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/BrotherGao/RDB/crc64"
+	"github.com/yarthur1/rdb-tool/crc64"
 )
+
+//from cupcake rdb/encoder.go
+const Version = 6
 
 // A Decoder must be implemented to parse a RDB file.
 type Decoder interface {
@@ -28,14 +39,14 @@ type Decoder interface {
 	Set(key, value []byte, expiry int64)
 	// StartHash is called at the beginning of a hash.
 	// Hset will be called exactly length times before EndHash.
-	StartHash(key []byte, length, expiry int64)
+	StartHash(key []byte, length, expiry int64, encodeType ValueType, sizeZip uint64) //modified
 	// Hset is called once for each field=value pair in a hash.
 	Hset(key, field, value []byte)
 	// EndHash is called when there are no more fields in a hash.
 	EndHash(key []byte)
 	// StartSet is called at the beginning of a set.
 	// Sadd will be called exactly cardinality times before EndSet.
-	StartSet(key []byte, cardinality, expiry int64)
+	StartSet(key []byte, cardinality, expiry int64, encodeType ValueType, sizeZip uint64) //modified
 	// Sadd is called once for each member of a set.
 	Sadd(key, member []byte)
 	// EndSet is called when there are no more fields in a set.
@@ -43,14 +54,14 @@ type Decoder interface {
 	// StartList is called at the beginning of a list.
 	// Rpush will be called exactly length times before EndList.
 	// If length of the list is not known, then length is -1
-	StartList(key []byte, length, expiry int64)
+	StartList(key []byte, length, expiry int64, encodeType ValueType, sizeZip uint64) //modified
 	// Rpush is called once for each value in a list.
 	Rpush(key, value []byte)
 	// EndList is called when there are no more values in a list.
 	EndList(key []byte)
 	// StartZSet is called at the beginning of a sorted set.
 	// Zadd will be called exactly cardinality times before EndZSet.
-	StartZSet(key []byte, cardinality, expiry int64)
+	StartZSet(key []byte, cardinality, expiry int64, encodeType ValueType, sizeZip uint64) //modified
 	// Zadd is called once for each member of a sorted set.
 	Zadd(key []byte, score float64, member []byte)
 	// EndZSet is called when there are no more members in a sorted set.
@@ -62,8 +73,8 @@ type Decoder interface {
 }
 
 // Decode parses a RDB file from r and calls the decode hooks on d.
-func Decode(r io.Reader, d Decoder) error {
-	decoder := &decode{d, make([]byte, 8), bufio.NewReader(r)}
+func Decode(r io.Reader, d Decoder) error {                 //decode entrance
+	decoder := &decode{d, make([]byte, 8), bufio.NewReader(r), 0}
 	return decoder.decode()
 }
 
@@ -76,7 +87,7 @@ func DecodeDump(dump []byte, db int, key []byte, expiry int64, d Decoder) error 
 		return err
 	}
 
-	decoder := &decode{d, make([]byte, 8), bytes.NewReader(dump[1:])}
+	decoder := &decode{d, make([]byte, 8), bytes.NewReader(dump[1:]), 0}
 	decoder.event.StartRDB()
 	decoder.event.StartDatabase(db)
 
@@ -96,6 +107,7 @@ type decode struct {
 	event  Decoder
 	intBuf []byte
 	r      byteReader
+	rdbVersion int
 }
 
 type ValueType byte
@@ -116,6 +128,7 @@ const (
 	TypeZSetZiplist   ValueType = 12
 	TypeHashZiplist   ValueType = 13
 	TypeListQuicklist ValueType = 14
+	TypeStreamListPacks ValueType = 15
 )
 
 const (
@@ -125,6 +138,9 @@ const (
 	rdb64bitLen = 0x81
 	rdbEncVal   = 3
 
+	rdbFlagModuleAux= 0xf7
+	rdbFlagIdle     = 0xf8
+	rdbFlagFreq     = 0xf9
 	rdbFlagAux      = 0xfa
 	rdbFlagResizeDB = 0xfb
 	rdbFlagExpiryMS = 0xfc
@@ -136,6 +152,14 @@ const (
 	rdbEncInt16 = 1
 	rdbEncInt32 = 2
 	rdbEncLZF   = 3
+
+	// reference https://github.com/sripathikrishnan/redis-rdb-tools/blob/548b11ec3c81a603f5b321228d07a61a0b940159/rdbtools/parser.py#L61
+	rdbModuleEOF = 0   // End of module value.
+	rdbModuleSInt = 1
+	rdbModuleUInt = 2
+	rdbModuleFloat = 3
+	rdbModuleDouble = 4
+	rdbModuleString = 5
 
 	rdbZiplist6bitlenString  = 0
 	rdbZiplist14bitlenString = 1
@@ -198,6 +222,16 @@ func (d *decode) decode() error {
 				return err
 			}
 			expiry = int64(binary.LittleEndian.Uint32(d.intBuf)) * 1000
+		case rdbFlagIdle:
+			_, _, err := d.readLength()
+			if err != nil {
+				return err
+			}
+		case rdbFlagFreq:
+			_, err := d.r.ReadByte()
+			if err != nil {
+				return err
+			}
 		case rdbFlagSelectDB:
 			if !firstDB {
 				d.event.EndDatabase(int(db))
@@ -208,9 +242,14 @@ func (d *decode) decode() error {
 			}
 			d.event.StartDatabase(int(db))
 			firstDB = false
+		case rdbFlagModuleAux:
+			d.skipModule()
 		case rdbFlagEOF:
 			d.event.EndDatabase(int(db))
 			d.event.EndRDB()
+			if d.rdbVersion >= 5{
+				d.skipNBytes(8)
+			}
 			return nil
 		default:
 			key, err := d.readString()
@@ -221,13 +260,14 @@ func (d *decode) decode() error {
 			if err != nil {
 				return err
 			}
-			expiry = 0
+			expiry = 0 // no expiry
 		}
 	}
 
 	panic("not reached")
 }
 
+// ValueType https://github.com/redis/redis/blob/265341b577dadcbdd40343bdf32d7dcb0a4bc1d1/src/rdb.c#L625
 func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 	switch typ {
 	case TypeString:
@@ -236,12 +276,12 @@ func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 			return err
 		}
 		d.event.Set(key, value, expiry)
-	case TypeList:
+	case TypeList:  // encoding linkedlist
 		length, _, err := d.readLength()
 		if err != nil {
 			return err
 		}
-		d.event.StartList(key, int64(length), expiry)
+		d.event.StartList(key, int64(length), expiry, typ, 0)
 		for i := uint64(0); i < length; i++ {
 			value, err := d.readString()
 			if err != nil {
@@ -255,9 +295,9 @@ func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 		if err != nil {
 			return err
 		}
-		d.event.StartList(key, int64(-1), expiry)
+		d.event.StartList(key, int64(-1), expiry, typ, 0)
 		for i := uint64(0); i < length; i++ {
-			d.readZiplist(key, 0, false)
+			d.readZiplist(key, 0, false, typ)
 		}
 		d.event.EndList(key)
 	case TypeSet:
@@ -265,7 +305,7 @@ func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 		if err != nil {
 			return err
 		}
-		d.event.StartSet(key, int64(cardinality), expiry)
+		d.event.StartSet(key, int64(cardinality), expiry, typ, 0)
 		for i := uint64(0); i < cardinality; i++ {
 			member, err := d.readString()
 			if err != nil {
@@ -274,12 +314,12 @@ func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 			d.event.Sadd(key, member)
 		}
 		d.event.EndSet(key)
-	case TypeZSet, TypeZSet2:
+	case TypeZSet, TypeZSet2: // encoding skiplist
 		cardinality, _, err := d.readLength()
 		if err != nil {
 			return err
 		}
-		d.event.StartZSet(key, int64(cardinality), expiry)
+		d.event.StartZSet(key, int64(cardinality), expiry, typ, 0)
 		for i := uint64(0); i < cardinality; i++ {
 			member, err := d.readString()
 			if err != nil {
@@ -298,12 +338,12 @@ func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 			d.event.Zadd(key, score, member)
 		}
 		d.event.EndZSet(key)
-	case TypeHash:
+	case TypeHash:  // encoding hashtable
 		length, _, err := d.readLength()
 		if err != nil {
 			return err
 		}
-		d.event.StartHash(key, int64(length), expiry)
+		d.event.StartHash(key, int64(length), expiry, typ, 0)
 		for i := uint64(0); i < length; i++ {
 			field, err := d.readString()
 			if err != nil {
@@ -317,24 +357,28 @@ func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 		}
 		d.event.EndHash(key)
 	case TypeHashZipmap:
-		return d.readZipmap(key, expiry)
+		return d.readZipmap(key, expiry, typ)
 	case TypeListZiplist:
-		return d.readZiplist(key, expiry, true)
+		return d.readZiplist(key, expiry, true, typ)
 	case TypeSetIntset:
-		return d.readIntset(key, expiry)
+		return d.readIntset(key, expiry, typ)
 	case TypeZSetZiplist:
-		return d.readZiplistZset(key, expiry)
+		return d.readZiplistZset(key, expiry, typ)
 	case TypeHashZiplist:
-		return d.readZiplistHash(key, expiry)
-	case TypeModule, TypeModule2:
-		return fmt.Errorf("rdb: not support parsing module for now")
+		return d.readZiplistHash(key, expiry, typ)
+	case TypeModule2:
+		return d.skipModule()
+	case TypeStreamListPacks:
+		return d.skipStream()
+	case TypeModule:
+		return fmt.Errorf("rdb: Unable to read Redis Modules RDB objects (key %s)", key)
 	default:
 		return fmt.Errorf("rdb: unknown object type %d for key %s", typ, key)
 	}
 	return nil
 }
 
-func (d *decode) readZipmap(key []byte, expiry int64) error {
+func (d *decode) readZipmap(key []byte, expiry int64, typ ValueType) error {
 	var length int
 	zipmap, err := d.readString()
 	if err != nil {
@@ -354,7 +398,7 @@ func (d *decode) readZipmap(key []byte, expiry int64) error {
 	} else {
 		length = int(lenByte)
 	}
-	d.event.StartHash(key, int64(length), expiry)
+	d.event.StartHash(key, int64(length), expiry, typ, uint64(len(zipmap)))
 	for i := 0; i < length; i++ {
 		field, err := readZipmapItem(buf, false)
 		if err != nil {
@@ -430,7 +474,7 @@ func readZipmapItemLength(buf *sliceBuffer, readFree bool) (int, int, error) {
 	return int(b), int(free), err
 }
 
-func (d *decode) readZiplist(key []byte, expiry int64, addListEvents bool) error {
+func (d *decode) readZiplist(key []byte, expiry int64, addListEvents bool, typ ValueType) error {
 	ziplist, err := d.readString()
 	if err != nil {
 		return err
@@ -441,7 +485,7 @@ func (d *decode) readZiplist(key []byte, expiry int64, addListEvents bool) error
 		return err
 	}
 	if addListEvents {
-		d.event.StartList(key, length, expiry)
+		d.event.StartList(key, length, expiry, typ, uint64(len(ziplist)))
 	}
 	for i := int64(0); i < length; i++ {
 		entry, err := readZiplistEntry(buf)
@@ -456,7 +500,7 @@ func (d *decode) readZiplist(key []byte, expiry int64, addListEvents bool) error
 	return nil
 }
 
-func (d *decode) readZiplistZset(key []byte, expiry int64) error {
+func (d *decode) readZiplistZset(key []byte, expiry int64, typ ValueType) error {
 	ziplist, err := d.readString()
 	if err != nil {
 		return err
@@ -467,7 +511,7 @@ func (d *decode) readZiplistZset(key []byte, expiry int64) error {
 		return err
 	}
 	cardinality /= 2
-	d.event.StartZSet(key, cardinality, expiry)
+	d.event.StartZSet(key, cardinality, expiry, typ, uint64(len(ziplist)))
 	for i := int64(0); i < cardinality; i++ {
 		member, err := readZiplistEntry(buf)
 		if err != nil {
@@ -487,7 +531,7 @@ func (d *decode) readZiplistZset(key []byte, expiry int64) error {
 	return nil
 }
 
-func (d *decode) readZiplistHash(key []byte, expiry int64) error {
+func (d *decode) readZiplistHash(key []byte, expiry int64, typ ValueType) error {
 	ziplist, err := d.readString()
 	if err != nil {
 		return err
@@ -498,7 +542,7 @@ func (d *decode) readZiplistHash(key []byte, expiry int64) error {
 		return err
 	}
 	length /= 2
-	d.event.StartHash(key, length, expiry)
+	d.event.StartHash(key, length, expiry, typ, uint64(len(ziplist)))
 	for i := int64(0); i < length; i++ {
 		field, err := readZiplistEntry(buf)
 		if err != nil {
@@ -586,7 +630,7 @@ func readZiplistEntry(buf *sliceBuffer) ([]byte, error) {
 	return nil, fmt.Errorf("rdb: unknown ziplist header byte: %d", header)
 }
 
-func (d *decode) readIntset(key []byte, expiry int64) error {
+func (d *decode) readIntset(key []byte, expiry int64, typ ValueType) error {
 	intset, err := d.readString()
 	if err != nil {
 		return err
@@ -608,7 +652,7 @@ func (d *decode) readIntset(key []byte, expiry int64) error {
 	}
 	cardinality := binary.LittleEndian.Uint32(lenBytes)
 
-	d.event.StartSet(key, int64(cardinality), expiry)
+	d.event.StartSet(key, int64(cardinality), expiry, typ, uint64(len(intset)))
 	for i := uint32(0); i < cardinality; i++ {
 		intBytes, err := buf.Slice(int(intSize))
 		if err != nil {
@@ -629,6 +673,124 @@ func (d *decode) readIntset(key []byte, expiry int64) error {
 	return nil
 }
 
+func (d *decode) skipModule() error {
+	var err error
+	var lcode uint64
+	_, _, err = d.readLength()
+	if err != nil {
+		return err
+	}
+	lcode, _, err = d.readLength()
+	if err != nil {
+		return err
+	}
+	for lcode != rdbModuleEOF {
+		switch lcode {
+		case rdbModuleSInt,rdbModuleUInt :
+			_, _, err = d.readLength()
+			if err != nil {
+				return err
+			}
+		case rdbModuleFloat:
+			err = d.skipBinaryFloat32()
+			if err != nil {
+				return err
+			}
+		case rdbModuleDouble:
+			err = d.skipBinaryDouble()
+			if err != nil {
+				return err
+			}
+		case rdbModuleString:
+			err = d.skipString()
+			if err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("rdb: Unknown module:%d", lcode)
+		}
+		lcode, _, err = d.readLength()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (d *decode) skipStream() error {
+	var err error
+	var l uint64
+	var lc uint64
+	var pending uint64
+	var consumers uint64
+	l, _, err = d.readLength()
+	if err != nil {
+		return err
+	}
+	for i:=uint64(0); i<l; i++ {
+		if err = d.skipString();err != nil {  // err is function scope
+			return err
+		}
+		if err = d.skipString();err != nil {
+			return err
+		}
+	}
+	for i:=0; i<3; i++ {
+		if _, _, err = d.readLength(); err != nil {
+			return err
+		}
+	}
+
+	l, _, err = d.readLength()
+	if err != nil {
+		return err
+	}
+	for i:=uint64(0); i<l; i++ {
+		if err = d.skipString();err != nil {
+			return err
+		}
+		for j:=0; j<2; j++ {
+			if _, _, err = d.readLength(); err != nil {
+				return err
+			}
+		}
+		pending, _, err = d.readLength()
+		if err != nil {
+			return err
+		}
+		for k:=uint64(0); k< pending; k++ {
+			if err=d.skipNBytes(24); err != nil {
+				return err
+			}
+			if _, _, err=d.readLength(); err != nil {
+				return err
+			}
+		}
+		consumers, _, err = d.readLength()
+		if err != nil {
+			return err
+		}
+		for k:=uint64(0); k< consumers; k++ {
+			if err=d.skipString(); err != nil {
+				return err
+			}
+			if err=d.skipNBytes(8); err != nil {
+				return err
+			}
+			lc, _, err=d.readLength()
+			if err != nil {
+				return err
+			}
+			if err=d.skipNBytes(lc*16); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 func (d *decode) checkHeader() error {
 	header := make([]byte, 9)
 	_, err := io.ReadFull(d.r, header)
@@ -641,10 +803,10 @@ func (d *decode) checkHeader() error {
 	}
 
 	version, _ := strconv.ParseInt(string(header[5:]), 10, 64)
-	if version < 1 || version > 8 {
-		return fmt.Errorf("Can't handle RDB format version %d", version)
+	if version < 1 || version > 9 {
+		return fmt.Errorf("rdb: invalid RDB version number %d", version)
 	}
-
+	d.rdbVersion = int(version)
 	return nil
 }
 
@@ -689,6 +851,46 @@ func (d *decode) readString() ([]byte, error) {
 	str := make([]byte, length)
 	_, err = io.ReadFull(d.r, str)
 	return str, err
+}
+
+func (d *decode) skipString() error {
+	length, encoded, err := d.readLength()
+	if err != nil {
+		return err
+	}
+	var skip uint64
+	if encoded {
+		switch length {
+		case rdbEncInt8:
+			skip = 1
+		case rdbEncInt16:
+			skip = 2
+		case rdbEncInt32:
+			skip = 4
+		case rdbEncLZF:
+			clen, _, err := d.readLength()
+			if err != nil {
+				return err
+			}
+			_, _, err = d.readLength()
+			if err != nil {
+				return err
+			}
+			skip = clen
+		}
+	} else {
+		skip = length
+	}
+
+	str := make([]byte, skip)
+	_, err = io.ReadFull(d.r, str)
+	return err
+}
+
+func (d *decode) skipNBytes(n uint64) error {
+	str := make([]byte, n)
+	_, err := io.ReadFull(d.r, str)
+	return err
 }
 
 func (d *decode) readUint8() (uint8, error) {
@@ -768,12 +970,29 @@ func (d *decode) readFloat64() (float64, error) {
 	panic("not reached")
 }
 
+//add zset2
 func (d *decode) readBinaryFloat64() (float64, error) {
 	if _, err := io.ReadFull(d.r, d.intBuf); err != nil {
 		return 0, err
 	}
 	bits := binary.LittleEndian.Uint64(d.intBuf)
 	return math.Float64frombits(bits), nil
+}
+
+func (d *decode) skipBinaryFloat32() error {
+	_, err := io.ReadFull(d.r, d.intBuf[:4])
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *decode) skipBinaryDouble() error {
+	_, err := io.ReadFull(d.r, d.intBuf[:8])
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (d *decode) readLength() (uint64, bool, error) {

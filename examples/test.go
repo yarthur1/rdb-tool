@@ -3,81 +3,68 @@
 package main
 
 import (
-	"fmt"
+	"bufio"
+	"flag"
+	"log"
 	"os"
-	"github.com/BrotherGao/RDB"
+	"path"
+	"time"
 
-	"github.com/BrotherGao/RDB/nopdecoder"
+	"github.com/yarthur1/rdb-tool"
+
+	"github.com/natefinch/lumberjack"
 )
 
-type decoder struct {
-	db int
-	i  int
-	nopdecoder.NopDecoder
-}
-
-func (p *decoder) StartDatabase(n int) {
-	p.db = n
-	fmt.Printf("Start parsing DB%d\n", p.db)
-}
-
-func (p *decoder) EndDatabase(n int) {
-	fmt.Printf("Finish parsing DB%d\n", p.db)
-}
-
-func (p *decoder) Aux(key, value []byte) {
-	fmt.Printf("aux_key=%q\n", key)
-	fmt.Printf("aux_value=%q\n", value)
-}
-
-func (p *decoder) Set(key, value []byte, expiry int64) {
-	fmt.Printf("db=%d %q -> %q ttl=%d\n", p.db, key, value, expiry)
-}
-
-func (p *decoder) Hset(key, field, value []byte) {
-	fmt.Printf("db=%d %q . %q -> %q\n", p.db, key, field, value)
-}
-
-func (p *decoder) Sadd(key, member []byte) {
-	fmt.Printf("db=%d %q { %q }\n", p.db, key, member)
-}
-
-func (p *decoder) StartList(key []byte, length, expiry int64) {
-	p.i = 0
-}
-
-func (p *decoder) Rpush(key, value []byte) {
-	fmt.Printf("db=%d %q[%d] -> %q\n", p.db, key, p.i, value)
-	p.i++
-}
-
-func (p *decoder) StartZSet(key []byte, cardinality, expiry int64) {
-	p.i = 0
-}
-
-func (p *decoder) Zadd(key []byte, score float64, member []byte) {
-	fmt.Printf("db=%d %q[%d] -> {%q, score=%g}\n", p.db, key, p.i, member, score)
-	p.i++
-}
-
-func (p *decoder) StartRDB() {
-	fmt.Println("Start parsing RDB")
-}
-
-func (p *decoder) EndRDB() {
-	fmt.Println("Finish parsing RDB")
-}
-
-func maybeFatal(err error) {
+func decodeRDB(csvPath string, rdbPath string, logWriter *log.Logger, version int) {
+	start := time.Now()
+	csvFile, err := os.OpenFile(csvPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC|os.O_SYNC, 0644)
 	if err != nil {
-		fmt.Printf("Fatal error: %s\n", err)
+		logWriter.Printf("create csv file error: %v\n", err)
 		os.Exit(1)
 	}
+	defer csvFile.Close()
+	csvWriter := bufio.NewWriterSize(csvFile, 1<<20) //1MB
+
+	deco := &rdb.DecoderImp{}  //use DecoderImp to parse rdb and calculate key size
+	deco.Init(csvWriter, version, logWriter)
+
+	rdbRead, err := os.Open(rdbPath)
+	if err != nil {
+		logWriter.Printf("open rdb file error: %v\n", err)
+		os.Exit(1)
+	}
+	err = rdb.Decode(rdbRead, deco)
+	if err != nil {
+		logWriter.Printf("decode rdb file error: %v\n", err)
+		os.Exit(1)
+	}
+	csvWriter.Flush()
+	csvFile.Sync()
+	elapsed := time.Since(start)
+	logWriter.Println("decode rdb file time: ", elapsed)
 }
 
+var logFile string = "./parse.log"
+var rdbFile string = "./dump.rdb"
+var csvFile string = "./mem.csv"
+
 func main() {
-	f, err := os.Open(os.Args[1])
-	maybeFatal(err)
-	err = rdb.Decode(f, &decoder{})
-	maybeFatal(err)
+	flag.StringVar(&logFile, "l", "./parse.log", "log file")
+	flag.StringVar(&rdbFile, "rdb", "./dump.rdb", "rdb data file")
+	flag.StringVar(&csvFile, "csv", "./mem.csv", "parsed csv data file")
+	flag.Parse()
+
+	os.MkdirAll(path.Dir(logFile), 0755)
+	hook := &lumberjack.Logger{
+		Filename:   logFile, //filePath
+		MaxSize:    50,       // megabytes
+		MaxBackups: 1,
+		MaxAge:     30,    //days
+		Compress:   false, // disabled by default
+	}
+	defer hook.Close()
+	logWriter := log.New(hook, "", log.LstdFlags)
+
+	//redis version 3-6, such as 3.xx=3, 4.xx=4, 5.xx=5
+	decodeRDB(csvFile, rdbFile, logWriter, 3)
 }
