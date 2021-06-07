@@ -1,124 +1,98 @@
-## RDB
+## Parse rdb file and Analyze Memory
 
-&emsp;&emsp;rdb是一个用于解析Redis的RDB文件的Go包。解析RDB格式参照[Redis RDB File Format](https://github.com/sripathikrishnan/redis-rdb-tools/blob/master/docs/RDB_File_Format.textile)   
-&emsp;&emsp;该包是在[cupcake/rdb](https://github.com/cupcake/rdb)基础上修改。增加对RDB Version 8的支持，以及bug的修复。
+The tool is for redis Memory Report like [redis-rdb-tools](https://github.com/sripathikrishnan/redis-rdb-tools). The tool consists of three parts: parse rdb, count keys' information and generate csv report file. Parse rdb section is based on [BrotherGao/RDB](https://github.com/BrotherGao/RDB), the statistics section references  [redis-rdb-tools](https://github.com/sripathikrishnan/redis-rdb-tools).
 
-RDB Version 8改动部分：
-*  Lua脚本可以持久化到RDB文件中，类型为RDB_OPCODE_AUX，以key-value的形式持久化。其中，key为"lua"，value为对应的脚本内容
-*  增加RDB_TYPE_ZSET_2类型，浮点类型不在以字符串的形式保存，而是以binary形式保存到RDB中去
-*  增加数据的长度增加RDB_64BITLEN类型
-*  增加RDB_TYPE_MODULE类型，Redis 4.0引入Module模块。(该包不支持对该部分的解析)
+The tool is almostly 3-10 times faster than [redis-rdb-tools](https://github.com/sripathikrishnan/redis-rdb-tools) when parse and calculate all keys in rdb file.
 
-## 使用
-如下是示例程序部分代码
+
+RDB parse modification：
+*  skip module and stream keys' parse
+
+Statistics section statistics
+*  the calculation of string keys' size is different(reference [pull 176](https://github.com/sripathikrishnan/redis-rdb-tools/pull/176))
+
+## example
+reference examples/test.go
 ```go
-type decoder struct {
-	db int
-	i  int
-	nopdecoder.NopDecoder
+package main
+
+import (
+	"bufio"
+	"flag"
+	"log"
+	"os"
+	"path"
+	"time"
+
+	"github.com/yarthur1/rdb-tool"
+
+	"github.com/natefinch/lumberjack"
+)
+
+func decodeRDB(csvPath string, rdbPath string, logWriter *log.Logger, version int) {
+	start := time.Now()
+	csvFile, err := os.OpenFile(csvPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC|os.O_SYNC, 0644)
+	if err != nil {
+		logWriter.Printf("create csv file error: %v\n", err)
+		os.Exit(1)
+	}
+	defer csvFile.Close()
+	csvWriter := bufio.NewWriterSize(csvFile, 1<<20) //1MB
+
+	deco := &rdb.DecoderImp{}  //use DecoderImp to parse rdb and calculate key size
+	deco.Init(csvWriter, version, logWriter)
+
+	rdbRead, err := os.Open(rdbPath)
+	if err != nil {
+		logWriter.Printf("open rdb file error: %v\n", err)
+		os.Exit(1)
+	}
+	err = rdb.Decode(rdbRead, deco)
+	if err != nil {
+		logWriter.Printf("decode rdb file error: %v\n", err)
+		os.Exit(1)
+	}
+	csvWriter.Flush()
+	csvFile.Sync()
+	elapsed := time.Since(start)
+	logWriter.Println("decode rdb file time: ", elapsed)
 }
 
-func (p *decoder) StartDatabase(n int) {
-	p.db = n
-	fmt.Printf("Start parsing DB%d\n", p.db)
-}
-
-func (p *decoder) EndDatabase(n int) {
-	fmt.Printf("Finish parsing DB%d\n", p.db)
-}
-
-func (p *decoder) Aux(key, value []byte) {
-	fmt.Printf("aux_key=%q\n", key)
-	fmt.Printf("aux_value=%q\n", value)
-}
-
-func (p *decoder) Set(key, value []byte, expiry int64) {
-	fmt.Printf("db=%d %q -> %q ttl=%d\n", p.db, key, value, expiry)
-}
-
-func (p *decoder) Hset(key, field, value []byte) {
-	fmt.Printf("db=%d %q . %q -> %q\n", p.db, key, field, value)
-}
-
-func (p *decoder) Sadd(key, member []byte) {
-	fmt.Printf("db=%d %q { %q }\n", p.db, key, member)
-}
-
-func (p *decoder) StartList(key []byte, length, expiry int64) {
-	p.i = 0
-}
-
-func (p *decoder) Rpush(key, value []byte) {
-	fmt.Printf("db=%d %q[%d] -> %q\n", p.db, key, p.i, value)
-	p.i++
-}
-
-func (p *decoder) StartZSet(key []byte, cardinality, expiry int64) {
-	p.i = 0
-}
-
-func (p *decoder) Zadd(key []byte, score float64, member []byte) {
-	fmt.Printf("db=%d %q[%d] -> {%q, score=%g}\n", p.db, key, p.i, member, score)
-	p.i++
-}
+var logFile string = "./parse.log"
+var rdbFile string = "./dump.rdb"
+var csvFile string = "./mem.csv"
+var version int = 3
 
 func main() {
-	f, err := os.Open(os.Args[1])
-	//处理err
-	err = rdb.Decode(f, &decoder{})
-	//处理err
+	flag.StringVar(&logFile, "l", "./parse.log", "log file")
+	flag.StringVar(&rdbFile, "rdb", "./dump.rdb", "rdb data file")
+	flag.StringVar(&csvFile, "csv", "./mem.csv", "parsed csv data file")
+	flag.IntVar(&version, "v", 3, "redis version 3-6 such as 3.xx=3, 4.xx=4, 5.xx=5")
+	flag.Parse()
+
+	os.MkdirAll(path.Dir(logFile), 0755)
+	hook := &lumberjack.Logger{
+		Filename:   logFile, //filePath
+		MaxSize:    50,       // megabytes
+		MaxBackups: 1,
+		MaxAge:     30,    //days
+		Compress:   false, // disabled by default
+	}
+	defer hook.Close()
+	logWriter := log.New(hook, "", log.LstdFlags)
+
+	//redis version 3-6, such as 3.xx=3, 4.xx=4, 5.xx=5
+	decodeRDB(csvFile, rdbFile, logWriter, 3)
 }
+
 ```
-运行结果如下：
+csv file format：dbnum,key type,key,size,elements,expiry
+
+expiry unit is ms, 0 present no expiry 
 ```powershell
-Start parsing RDB
-aux_key="redis-ver"
-aux_value="4.0.10"
-aux_key="redis-bits"
-aux_value="64"
-aux_key="ctime"
-aux_value="1545881958"
-aux_key="used-mem"
-aux_value="2081152"
-aux_key="repl-stream-db"
-aux_value="0"
-aux_key="repl-id"
-aux_value="8d4eda6495c7cb8ae7c5ba0626abbcc79c56f9ca"
-aux_key="repl-offset"
-aux_value="0"
-aux_key="aof-preamble"
-aux_value="0"
-Start parsing DB0
-db=0 "klose" -> "11" ttl=0
-Finish parsing DB0
-Start parsing DB1
-db=1 "klose"[0] -> {"b", score=1.123456789}
-db=1 "klose"[1] -> {"a", score=11.345}
-db=1 "klose"[2] -> {"c", score=123}
-Finish parsing DB1
-Start parsing DB2
-db=2 "klose" . "a" -> "1"
-db=2 "klose" . "b" -> "2"
-db=2 "klose" . "c" -> "3"
-Finish parsing DB2
-Start parsing DB11
-db=11 "klose" -> "123456" ttl=0
-db=11 "list"[0] -> "a"
-db=11 "list"[1] -> "b"
-db=11 "list"[2] -> "c"
-db=11 "list"[3] -> "d"
-db=11 "list"[4] -> "e"
-aux_key="lua"
-aux_value="return redis.call('get', KEYS[1])"
-aux_key="lua"
-aux_value="return redis.call('llen', KEYS[1])"
-Finish parsing DB11
-Finish parsing RDB
+0,sortedset,klose,96,1,0
+2,string,klose_ttl,88,8,1545854316442
+11,string,klose,56,8,0
+11,list,list,169,10,0
 ```
-具体参见example目录下的test.go文件。fixture目录下为用于测试的各个版本的rdb文件
 
-## 安装
-
-```
-go get github.com/BrotherGao/RDB
-```
