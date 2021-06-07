@@ -47,11 +47,13 @@ func decodeRDB(csvPath string, rdbPath string, logWriter *log.Logger, version in
 var logFile string = "./parse.log"
 var rdbFile string = "./dump.rdb"
 var csvFile string = "./mem.csv"
+var version int = 3
 
 func main() {
 	flag.StringVar(&logFile, "l", "./parse.log", "log file")
 	flag.StringVar(&rdbFile, "rdb", "./dump.rdb", "rdb data file")
 	flag.StringVar(&csvFile, "csv", "./mem.csv", "parsed csv data file")
+	flag.IntVar(&version, "v", 3, "redis version 3-6 such as 3.xx=3, 4.xx=4, 5.xx=5")
 	flag.Parse()
 
 	os.MkdirAll(path.Dir(logFile), 0755)
