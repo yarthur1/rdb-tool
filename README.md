@@ -8,8 +8,11 @@ The tool is almostly 3-10 times faster than [redis-rdb-tools](https://github.com
 RDB parse modification：
 *  skip module and stream keys' parse
 
-Statistics section statistics
+Statistics section modification
 *  the calculation of string keys' size is different(reference [pull 176](https://github.com/sripathikrishnan/redis-rdb-tools/pull/176))
+*  calculate keys' size default use 64 bit architecture
+
+support rdb version <= 9 (redis 3.2 - 6.2)
 
 ## example
 reference examples/test.go

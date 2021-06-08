@@ -118,7 +118,7 @@ const (
 	TypeSet     ValueType = 2
 	TypeZSet    ValueType = 3
 	TypeHash    ValueType = 4
-	TypeZSet2   ValueType = 5
+	TypeZSet2   ValueType = 5  // ZSET version 2 with doubles stored in binary.
 	TypeModule  ValueType = 6
 	TypeModule2 ValueType = 7
 
