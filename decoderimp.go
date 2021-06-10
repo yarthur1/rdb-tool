@@ -5,7 +5,6 @@ import (
     "fmt"
     "log"
     "os"
-    "strings"
 
     "github.com/yarthur1/rdb-tool/nopdecoder"
 )
@@ -49,7 +48,7 @@ func (p *DecoderImp) StartDatabase(n int) {
 func (p *DecoderImp) Set(key, value []byte, expiry int64) {
     size := topLevelObjOverhead(key, expiry) + sizeOfString(value)
     len := stringElementNum(value)
-    keyStr := strings.ReplaceAll(strings.ReplaceAll(string(key), ",", "["),"\n","]")
+    keyStr := string(key)
     lineStr := fmt.Sprintf("%d,string,%s,%d,%d,%d\n", p.db, keyStr, size, len, expiry)
     p.writeString(lineStr, key)
 }
@@ -94,7 +93,7 @@ func (p *DecoderImp) EndList(key []byte) {
                 (p.curKey.listItemsZippedSize)
         p.curKey.quickListFlag = false
     }
-    keyStr := strings.ReplaceAll(strings.ReplaceAll(p.curKey.key, ",", "["),"\n","]")
+    keyStr := p.curKey.key
     lineStr := fmt.Sprintf("%d,%s,%s,%d,%d,%d\n", p.db, p.curKey.keyType, keyStr, p.curKey.size, p.curKey.eleNums, p.curKey.expiry)
     p.writeString(lineStr, key)
 }
@@ -125,7 +124,7 @@ func (p *DecoderImp) Hset(key, field, value []byte) {
 
 // EndHash is called when there are no more fields in a hash.
 func (p *DecoderImp) EndHash(key []byte) {
-    keyStr := strings.ReplaceAll(strings.ReplaceAll(p.curKey.key, ",", "["),"\n","]")
+    keyStr := p.curKey.key
     lineStr := fmt.Sprintf("%d,%s,%s,%d,%d,%d\n", p.db, p.curKey.keyType, keyStr, p.curKey.size, p.curKey.eleNums, p.curKey.expiry)
     p.writeString(lineStr, key)
 }
@@ -157,7 +156,7 @@ func (p *DecoderImp) Sadd(key, member []byte) {
 
 // EndSet is called when there are no more fields in a set.
 func (p *DecoderImp) EndSet(key []byte) {
-    keyStr := strings.ReplaceAll(strings.ReplaceAll(p.curKey.key, ",", "["),"\n","]")
+    keyStr := p.curKey.key
     lineStr := fmt.Sprintf("%d,%s,%s,%d,%d,%d\n", p.db, p.curKey.keyType, keyStr, p.curKey.size, p.curKey.eleNums, p.curKey.expiry)
     p.writeString(lineStr, key)
 }
@@ -188,7 +187,7 @@ func (p *DecoderImp) Zadd(key []byte, score float64, member []byte) {
 
 // EndZSet is called when there are no more members in a sorted set.
 func (p *DecoderImp) EndZSet(key []byte) {
-    keyStr := strings.ReplaceAll(strings.ReplaceAll(p.curKey.key, ",", "["),"\n","]")
+    keyStr := p.curKey.key
     lineStr := fmt.Sprintf("%d,%s,%s,%d,%d,%d\n", p.db, p.curKey.keyType, keyStr, p.curKey.size, p.curKey.eleNums, p.curKey.expiry)
     p.writeString(lineStr, key)
 }

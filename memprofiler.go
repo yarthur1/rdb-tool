@@ -85,8 +85,10 @@ func isIntegerType(val []byte) (bool, uint64) { //is integer ,return val,or retu
     if val[0] == '0' && l > 1 {
         return false, uint64(l)
     }
-    if val[0] == '-' && val[1] == '0' && l > 1 {
-        return false, uint64(l)
+    if l > 1 {         // fix panic: index out of range [1] with length 1
+        if val[0] == '-' && val[1] == '0' {
+            return false, uint64(l)
+        }
     }
     num, err := strconv.ParseInt(string(val), 10, 64) //REDIS_ENCODING_INT long 64bit architecture
     if err == nil {
